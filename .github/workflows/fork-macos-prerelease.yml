@@ -1,0 +1,118 @@
+name: Fork macOS prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 测试版本标签，例如 v3.5.3-agent.1
+        required: true
+        default: v3.5.3-agent.1
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-macos-prerelease
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: Build and publish macOS DMGs
+    if: github.repository == 'ZstarsK/codex-tweaks'
+    runs-on: macos-26
+    timeout-minutes: 35
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate test version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-agent\.[1-9][0-9]*$ ]]
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "标签已存在：$RELEASE_TAG" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release 已存在：$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+
+      - name: Test macOS
+        run: |
+          set -euo pipefail
+          mise run generate
+          (
+            cd backend
+            go vet ./...
+            go test -race ./...
+          )
+          mise run contract:check
+          xcodebuild \
+            -project CodexTweaks.xcodeproj \
+            -scheme CodexTweaks \
+            -configuration Debug \
+            -destination "platform=macOS,arch=$(uname -m)" \
+            -derivedDataPath build/DerivedData \
+            -packageAuthorizationProvider netrc \
+            test
+
+      - name: Build ad-hoc signed macOS release
+        run: mise run release
+
+      - name: Verify release artifacts
+        run: mise run release:verify
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 \
+            "Codex-Tweaks-${RELEASE_TAG}.dmg" \
+            "Codex-Tweaks-${RELEASE_TAG}-arm64.dmg" \
+            "Codex-Tweaks-${RELEASE_TAG}-x86_64.dmg" \
+            > SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-tweaks-${{ inputs.tag }}-macos
+          path: |
+            dist/Codex-Tweaks-${{ inputs.tag }}.dmg
+            dist/Codex-Tweaks-${{ inputs.tag }}-arm64.dmg
+            dist/Codex-Tweaks-${{ inputs.tag }}-x86_64.dmg
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "dist/Codex-Tweaks-${RELEASE_TAG}.dmg" \
+            "dist/Codex-Tweaks-${RELEASE_TAG}-arm64.dmg" \
+            "dist/Codex-Tweaks-${RELEASE_TAG}-x86_64.dmg" \
+            "dist/SHA256SUMS" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG · macOS Agent mode test" \
+            --prerelease \
+            --notes "macOS Agent 模式测试构建
+
+          - Universal、Apple Silicon 与 Intel 三种 DMG
+          - 使用 ad-hoc 签名，未进行 Apple 公证
+          - 用于验证 Dock、应用切换器、菜单栏图标与后台注入行为
+          - 测试完成后，上游 PR 只包含 Agent 模式功能代码，不包含此 fork 专用发布流程"
